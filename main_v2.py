@@ -190,7 +190,10 @@ class Api:
                     "community": "public",
                     "snmp_port": 161,
                     "device_template": "unknown",
-                    "last_snmp_check": None
+                    "last_snmp_check": None,
+                    "sysDescr": "",
+                    "sysName": "",
+                    "sysObjectID": ""
                 }
                 self._start_ping(ip)
             if push:
@@ -401,6 +404,9 @@ class Api:
                         dev["snmp_port"]       = res["snmp_port"]
                         dev["device_template"] = res["device_template"]
                         dev["last_snmp_check"] = ts()
+                        dev["sysDescr"]        = res.get("sysDescr", "")
+                        dev["sysName"]         = res.get("sysName", "")
+                        dev["sysObjectID"]     = res.get("sysObjectID", "")
 
                     # Push update to UI
                     payload = {
@@ -409,7 +415,9 @@ class Api:
                         "snmp_version": dev["snmp_version"],
                         "device_template": dev["device_template"],
                         "alive": dev["alive"],
-                        "latency": dev["latency"]
+                        "latency": dev["latency"],
+                        "sysDescr": dev.get("sysDescr", ""),
+                        "sysName": dev.get("sysName", "")
                     }
                     self._push_json("_onSnmpUpdate", payload)
 
@@ -432,6 +440,32 @@ class Api:
             port=int(settings.get("port", 161))
         )
         return r
+
+    def get_live_snmp(self, ip: str) -> dict:
+        with self._lock:
+            if ip not in self._devices: return {"ok": False, "error": "Cihaz bulunamadı"}
+            dev = self._devices[ip]
+            settings = {
+                "snmp_version": dev.get("snmp_version", "v2c"),
+                "community": dev.get("community", "public"),
+                "snmp_port": dev.get("snmp_port", 161),
+                "timeout": 1500
+            }
+            template = dev.get("device_template", "unknown")
+
+        return snmp_manager.get_live_snmp_data(ip, template, settings)
+
+    def get_snmp_interfaces(self, ip: str) -> dict:
+        with self._lock:
+            if ip not in self._devices: return {"ok": False, "error": "Cihaz bulunamadı"}
+            dev = self._devices[ip]
+            settings = {
+                "snmp_version": dev.get("snmp_version", "v2c"),
+                "community": dev.get("community", "public"),
+                "snmp_port": dev.get("snmp_port", 161),
+                "timeout": 2000
+            }
+        return snmp_manager.get_interface_stats(ip, settings)
 
     def _save_all_to_current_profile(self):
         # Implementation of auto-save if needed, or we can just use save_profile logic
@@ -479,6 +513,9 @@ class Api:
                 dev["snmp_port"]       = d.get("snmp_port", 161)
                 dev["device_template"] = d.get("device_template", "unknown")
                 dev["last_snmp_check"] = d.get("last_snmp_check")
+                dev["sysDescr"]        = d.get("sysDescr", "")
+                dev["sysName"]         = d.get("sysName", "")
+                dev["sysObjectID"]     = d.get("sysObjectID", "")
         return {"ok": True, "devices": data}
 
     def delete_profile(self, name: str) -> dict:
@@ -796,6 +833,75 @@ main { position:fixed; top:104px; bottom:0; left:0; right:0;
 .ctx-item.danger:hover { color:var(--red); }
 .ctx-sep { height:1px; background:var(--border); margin:4px 12px; }
 .ctx-section { padding:4px 14px 2px; font-size:9px; letter-spacing:.12em; color:var(--muted); text-transform:uppercase; }
+.ctx-item.disabled { opacity: .4; cursor: not-allowed; pointer-events: none; }
+.ctx-item.has-sub { position: relative; }
+.ctx-item.has-sub::after { content: "›"; position: absolute; right: 14px; font-size: 16px; top: 50%; transform: translateY(-50%); }
+.ctx-submenu {
+  display: none; position: absolute; left: 100%; top: -6px;
+  background: color-mix(in srgb,var(--surface) 97%,#000);
+  border: 1px solid var(--border); border-radius: 12px; padding: 6px 0;
+  min-width: 180px; box-shadow: 0 10px 40px rgba(0,0,0,.5);
+}
+.ctx-item.has-sub:hover > .ctx-submenu { display: block; }
+
+/* ── SNMP PANEL ── */
+.snmp-panel {
+  position: fixed; top: 0; right: -420px; width: 400px; height: 100%;
+  background: color-mix(in srgb, var(--surface) 96%, #000);
+  border-left: 1px solid var(--border); z-index: 1000;
+  box-shadow: -10px 0 40px rgba(0,0,0,0.5);
+  transition: right 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+  display: flex; flex-direction: column; overflow: hidden;
+  backdrop-filter: blur(10px);
+}
+.snmp-panel.open { right: 0; }
+.panel-header {
+  padding: 24px; border-bottom: 1px solid var(--border);
+  background: linear-gradient(to bottom, rgba(0,212,255,0.05), transparent);
+}
+.panel-title { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+.panel-title h2 { font-size: 18px; font-weight: 800; letter-spacing: 0.05em; color: var(--accent); }
+.panel-status { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); }
+.panel-status .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px var(--green); }
+
+.panel-tabs { display: flex; background: var(--hover); padding: 4px; gap: 4px; }
+.panel-tab {
+  flex: 1; padding: 10px; font-size: 10px; font-weight: 700; text-transform: uppercase;
+  text-align: center; cursor: pointer; border-radius: 6px; color: var(--muted);
+  transition: all 0.2s;
+}
+.panel-tab.active { background: var(--surface); color: var(--accent); box-shadow: 0 2px 8px rgba(0,0,0,0.2); }
+
+.panel-content { flex: 1; overflow-y: auto; padding: 24px; }
+.metric-box { margin-bottom: 24px; }
+.metric-label { font-size: 11px; font-weight: 700; color: var(--muted); text-transform: uppercase; margin-bottom: 10px; display: flex; justify-content: space-between; }
+.metric-val { color: var(--text); }
+.prog-bg { height: 8px; background: #000; border-radius: 4px; overflow: hidden; position: relative; border: 1px solid var(--border); }
+.prog-fill { height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent), var(--green)); transition: width 0.5s ease-out; }
+.prog-fill.warning { background: linear-gradient(90deg, var(--yellow), var(--red)); }
+
+.info-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.info-item label { display: block; font-size: 9px; color: var(--muted); text-transform: uppercase; margin-bottom: 4px; }
+.info-item div { font-size: 12px; color: var(--text); font-weight: 600; }
+
+.port-grid { display: grid; grid-template-columns: repeat(8, 1fr); gap: 6px; margin-top: 10px; }
+.port-box {
+  aspect-ratio: 1; border-radius: 4px; background: #000; border: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: center; font-size: 8px; font-weight: 800;
+  color: #fff; cursor: help; transition: all 0.2s;
+}
+.port-box.up { background: var(--green); border-color: #fff2; box-shadow: inset 0 0 10px rgba(0,0,0,0.3); }
+.port-box.down { background: var(--red); opacity: 0.6; }
+.port-box.trunk { background: var(--accent); }
+
+.alert-banner {
+  background: color-mix(in srgb, var(--red) 15%, transparent);
+  border: 1px solid color-mix(in srgb, var(--red) 40%, transparent);
+  padding: 10px; border-radius: 8px; margin-bottom: 16px; color: var(--red);
+  font-size: 11px; font-weight: 700; display: flex; align-items: center; gap: 8px;
+  animation: pulse-red 2s infinite;
+}
+@keyframes pulse-red { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
 
 /* ── MODALS ── */
 .overlay {
@@ -969,6 +1075,18 @@ main { position:fixed; top:104px; bottom:0; left:0; right:0;
   <div class="ctx-item" id="ctxMacVendor">🏷 MAC / Üretici Bul</div>
   <div class="ctx-item" id="ctxLog">📋 Kesinti Geçmişi</div>
   <div class="ctx-sep"></div>
+  <div class="ctx-section">Ağ İzleme</div>
+  <div class="ctx-item has-sub" id="ctxSnmpRoot">📡 SNMP İzleme
+    <div class="ctx-submenu">
+      <div class="ctx-item" onclick="openSnmpModal()">SNMP Ayarları</div>
+      <div class="ctx-item" onclick="openSnmpPanel('perf')">Canlı Performans</div>
+      <div class="ctx-item" onclick="openSnmpPanel('port')">Port Durumu</div>
+      <div class="ctx-item" onclick="openSnmpPanel('traffic')">Trafik Analizi</div>
+      <div class="ctx-item" onclick="openSnmpPanel('sys')">Sistem Bilgisi</div>
+      <div class="ctx-item" onclick="openSnmpPanel('sensors')">Sensörler</div>
+    </div>
+  </div>
+  <div class="ctx-sep"></div>
   <div class="ctx-section">Ağ Araçları</div>
   <div class="ctx-item" id="ctxPortScan">🔌 Port Tarama</div>
   <div class="ctx-item" id="ctxTrace">🛤 Trace Route</div>
@@ -981,6 +1099,67 @@ main { position:fixed; top:104px; bottom:0; left:0; right:0;
   <div class="ctx-item" id="ctxRDP">🖱 RDP (Uzak Masaüstü)</div>
   <div class="ctx-sep"></div>
   <div class="ctx-item danger" id="ctxDelete">🗑 Cihazı Sil</div>
+</div>
+
+<!-- ═══ SNMP RIGHT PANEL ══════════════════════════════════════════════════════ -->
+<div class="snmp-panel" id="snmpPanel">
+  <div class="panel-header">
+    <div style="display:flex; justify-content:space-between; align-items:start">
+      <div class="panel-title">
+        <div class="logo-icon">📡</div>
+        <div>
+          <h2 id="pnlDeviceName">Cihaz Adı</h2>
+          <div class="panel-status"><div class="dot"></div> ONLINE • <span id="pnlIp">0.0.0.0</span></div>
+        </div>
+      </div>
+      <button class="gear-btn" onclick="closeSnmpPanel()" style="font-size:20px">×</button>
+    </div>
+  </div>
+
+  <div class="panel-tabs">
+    <div class="panel-tab active" data-tab="perf">Perf</div>
+    <div class="panel-tab" data-tab="port">Port</div>
+    <div class="panel-tab" data-tab="traffic">Traffic</div>
+    <div class="panel-tab" data-tab="sys">Sys Info</div>
+  </div>
+
+  <div class="panel-content" id="pnlContent">
+    <!-- Content injected via JS -->
+    <div id="pnlPerf">
+       <div class="alert-banner" id="pnlAlert" style="display:none">
+         <span>⚠</span> <span id="pnlAlertMsg">HIGH CPU DETECTED</span>
+       </div>
+
+       <div class="metric-box">
+         <div class="metric-label"><span>CPU LOAD</span> <span class="metric-val" id="pnlCpuVal">0%</span></div>
+         <div class="prog-bg"><div class="prog-fill" id="pnlCpuBar"></div></div>
+       </div>
+       <div class="metric-box">
+         <div class="metric-label"><span>RAM USAGE</span> <span class="metric-val" id="pnlRamVal">0%</span></div>
+         <div class="prog-bg"><div class="prog-fill" id="pnlRamBar"></div></div>
+       </div>
+       <div class="metric-box">
+         <div class="metric-label"><span>UPTIME</span></div>
+         <div class="metric-val" id="pnlUptime" style="font-size:24px; font-weight:800; color:var(--accent)">0 days</div>
+       </div>
+    </div>
+
+    <div id="pnlPort" style="display:none">
+       <div class="metric-label">INTERFACE STATUS (48 PORT GRID)</div>
+       <div class="port-grid" id="pnlPortGrid"></div>
+    </div>
+
+    <div id="pnlTraffic" style="display:none">
+       <div class="metric-label">REAL-TIME TRAFFIC (MBPS)</div>
+       <div style="height:150px; background:#000; border:1px solid var(--border); border-radius:8px; display:flex; align-items:center; justify-content:center; color:var(--muted); font-size:10px">
+          [ Traffic Chart Placeholder ]
+       </div>
+    </div>
+
+    <div id="pnlSys" style="display:none">
+       <div class="info-grid" id="pnlSysGrid"></div>
+    </div>
+  </div>
 </div>
 
 <!-- ═══ MODAL: Toplu IP ════════════════════════════════════════════════════════ -->
@@ -1468,9 +1647,207 @@ window._onPingUpdate=json=>{
   updateCardDOM({ip:d.ip,alive:d.alive,latency:d.latency});
 };
 
+// ─── SNMP LIVE PANEL ──────────────────────────────────────────────────────────
+let snmpPollInterval = null;
+let activeSnmpIp     = null;
+let activeTab        = 'perf';
+let prevTrafficData  = {}; // interface name -> {in, out, ts}
+
+async function openSnmpPanel(tab = 'perf'){
+  if(!ctxIp) return;
+  activeSnmpIp = ctxIp;
+  activeTab = tab;
+
+  const dev = devices[activeSnmpIp];
+  document.getElementById('pnlDeviceName').textContent = dev.label || activeSnmpIp;
+  document.getElementById('pnlIp').textContent = activeSnmpIp;
+
+  // Reset UI
+  switchTab(tab);
+  document.getElementById('snmpPanel').classList.add('open');
+
+  startSnmpPolling();
+}
+
+function closeSnmpPanel(){
+  document.getElementById('snmpPanel').classList.remove('open');
+  stopSnmpPolling();
+  activeSnmpIp = null;
+}
+
+function switchTab(tabId){
+  activeTab = tabId;
+  document.querySelectorAll('.panel-tab').forEach(t => {
+    t.classList.toggle('active', t.dataset.tab === tabId);
+  });
+
+  const sections = ['pnlPerf', 'pnlPort', 'pnlTraffic', 'pnlSys'];
+  sections.forEach(s => {
+    document.getElementById(s).style.display = s.toLowerCase().includes(tabId) ? 'block' : 'none';
+  });
+
+  refreshPanelData();
+}
+
+document.querySelectorAll('.panel-tab').forEach(t => {
+  t.addEventListener('click', () => switchTab(t.dataset.tab));
+});
+
+function startSnmpPolling(){
+  stopSnmpPolling();
+  refreshPanelData();
+  snmpPollInterval = setInterval(refreshPanelData, 5000);
+}
+
+function stopSnmpPolling(){
+  if(snmpPollInterval){ clearInterval(snmpPollInterval); snmpPollInterval = null; }
+}
+
+async function refreshPanelData(){
+  if(!activeSnmpIp) return;
+
+  if(activeTab === 'perf'){
+    const r = await window.pywebview.api.get_live_snmp(activeSnmpIp);
+    if(r.ok) updatePerfUI(r);
+  }
+
+  if(activeTab === 'traffic' || activeTab === 'port'){
+    const r = await window.pywebview.api.get_snmp_interfaces(activeSnmpIp);
+    if(r.ok){
+      if(activeTab === 'port') updatePortUI(r.interfaces);
+      if(activeTab === 'traffic') updateTrafficUI(r.interfaces);
+    }
+  }
+
+  if(activeTab === 'sys'){
+     updateSysUI(devices[activeSnmpIp]);
+  }
+}
+
+function updatePerfUI(data){
+  const cpuVal = data.cpu || 0;
+  const ramVal = data.ram || 0;
+
+  document.getElementById('pnlCpuVal').textContent = cpuVal + '%';
+  document.getElementById('pnlCpuBar').style.width = cpuVal + '%';
+  document.getElementById('pnlCpuBar').classList.toggle('warning', cpuVal > 90);
+
+  document.getElementById('pnlRamVal').textContent = ramVal + '%';
+  document.getElementById('pnlRamBar').style.width = ramVal + '%';
+  document.getElementById('pnlRamBar').classList.toggle('warning', ramVal > 90);
+
+  // Template specific extra metrics
+  let extraHtml = '';
+  if(data.sessions) extraHtml += `<div class="metric-box"><div class="metric-label">SESSIONS</div><div class="metric-val" style="font-size:18px; color:var(--green)">${data.sessions}</div></div>`;
+
+  const existingExtra = document.getElementById('pnlExtra');
+  if(existingExtra) existingExtra.innerHTML = extraHtml;
+  else {
+    const div = document.createElement('div');
+    div.id = 'pnlExtra';
+    div.innerHTML = extraHtml;
+    document.getElementById('pnlPerf').appendChild(div);
+  }
+
+  // Ticks to days/hours
+  const ticks = parseInt(data.uptime_ticks || 0);
+  const totalSec = Math.floor(ticks / 100);
+  const days = Math.floor(totalSec / 86400);
+  const hours = Math.floor((totalSec % 86400) / 3600);
+  document.getElementById('pnlUptime').textContent = `${days} days, ${hours} hours`;
+
+  // Alert
+  const alertEl = document.getElementById('pnlAlert');
+  if(cpuVal > 90 || ramVal > 90){
+    alertEl.style.display = 'flex';
+    document.getElementById('pnlAlertMsg').textContent = cpuVal > 90 ? 'HIGH CPU DETECTED' : 'HIGH RAM DETECTED';
+  } else {
+    alertEl.style.display = 'none';
+  }
+}
+
+function updatePortUI(interfaces){
+  const grid = document.getElementById('pnlPortGrid');
+  grid.innerHTML = '';
+  // Show up to 48 ports
+  interfaces.slice(0, 48).forEach((iface, idx) => {
+    const box = document.createElement('div');
+    const isUp = iface.status === 1;
+    box.className = `port-box ${isUp ? 'up' : 'down'}`;
+    box.textContent = idx + 1;
+    box.title = `${iface.name}\nStatus: ${isUp ? 'UP' : 'DOWN'}`;
+    grid.appendChild(box);
+  });
+}
+
+function updateTrafficUI(interfaces){
+  const container = document.getElementById('pnlTraffic');
+  let html = '<div class="metric-label">REAL-TIME TRAFFIC (MBPS)</div>';
+
+  interfaces.forEach(iface => {
+    const prev = prevTrafficData[iface.name];
+    let inMbps = 0, outMbps = 0;
+
+    if(prev){
+      const dIn = iface.in_octets - prev.in;
+      const dOut = iface.out_octets - prev.out;
+      const dTs = iface.ts - prev.ts;
+
+      if(dTs > 0 && dIn >= 0 && dOut >= 0){
+         inMbps = (dIn * 8) / (dTs * 1000000);
+         outMbps = (dOut * 8) / (dTs * 1000000);
+      }
+    }
+
+    prevTrafficData[iface.name] = {in: iface.in_octets, out: iface.out_octets, ts: iface.ts};
+
+    if(inMbps > 0.01 || outMbps > 0.01){
+      html += `
+        <div style="margin-bottom:12px; padding:8px; background:var(--hover); border-radius:6px">
+          <div style="font-size:10px; font-weight:700; color:var(--accent); margin-bottom:4px">${esc(iface.name)}</div>
+          <div style="display:flex; justify-content:space-between; font-size:10px">
+            <span>IN: <span style="color:var(--green)">${inMbps.toFixed(2)} Mbps</span></span>
+            <span>OUT: <span style="color:var(--blue)">${outMbps.toFixed(2)} Mbps</span></span>
+          </div>
+        </div>
+      `;
+    }
+  });
+
+  container.innerHTML = html || '<div class="metric-label">No active traffic detected</div>';
+}
+
+function updateSysUI(dev){
+  const grid = document.getElementById('pnlSysGrid');
+  const items = [
+    {label: 'SysName', val: dev.sysName || 'N/A'},
+    {label: 'Template', val: dev.device_template},
+    {label: 'Version', val: dev.snmp_version},
+    {label: 'Community', val: dev.community},
+    {label: 'Last Check', val: dev.last_snmp_check || 'N/A'},
+    {label: 'SysDescr', val: dev.sysDescr || 'N/A'}
+  ];
+  grid.innerHTML = items.map(i => `
+    <div class="info-item">
+      <label>${i.label}</label>
+      <div>${esc(i.val)}</div>
+    </div>
+  `).join('');
+}
+
 // ─── CONTEXT MENU ─────────────────────────────────────────────────────────────
 function showCtx(e, ip){
   ctxIp=ip;
+  const dev = devices[ip];
+  const snmpRoot = document.getElementById('ctxSnmpRoot');
+  if(snmpRoot){
+    if(dev && dev.snmp_active){
+      snmpRoot.classList.remove('disabled');
+    } else {
+      snmpRoot.classList.add('disabled');
+    }
+  }
+
   const m=document.getElementById('ctxMenu');
   m.style.display='block';
   const vw=window.innerWidth,vh=window.innerHeight;

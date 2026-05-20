@@ -72,6 +72,129 @@ def detect_template(sys_descr):
 
     return "unknown"
 
+def get_live_snmp_data(ip, template, settings):
+    """
+    Fetches live metrics like CPU, RAM, Uptime.
+    """
+    version = settings.get('snmp_version', 'v2c')
+    community = settings.get('community', 'public')
+    timeout = float(settings.get('timeout', 1500)) / 1000.0
+    port = int(settings.get('snmp_port', 161))
+
+    # Common OIDs
+    OID_UPTIME = '1.3.6.1.2.1.1.3.0'
+
+    oids = [OID_UPTIME]
+
+    # Template specific OIDs
+    if template == "cisco_ios":
+        oids.append('1.3.6.1.4.1.9.9.109.1.1.1.1.7.1') # CPU 5min
+        oids.append('1.3.6.1.4.1.9.9.48.1.1.1.5.1')     # Free Mem
+        oids.append('1.3.6.1.4.1.9.9.48.1.1.1.6.1')     # Used Mem
+    elif template == "fortigate":
+        oids.append('1.3.6.1.4.1.12356.101.4.1.3.0')   # CPU
+        oids.append('1.3.6.1.4.1.12356.101.4.1.4.0')   # RAM
+        oids.append('1.3.6.1.4.1.12356.101.4.1.8.0')   # Sessions
+    elif template == "windows":
+        oids.append('1.3.6.1.2.1.25.3.3.1.2.1')        # CPU Load
+        oids.append('1.3.6.1.2.1.25.2.3.1.6.1')        # Used Storage/RAM
+        oids.append('1.3.6.1.2.1.25.2.3.1.5.1')        # Total Storage/RAM
+    elif template == "linux":
+        oids.append('1.3.6.1.4.1.2021.11.11.0')       # CPU Idle
+        oids.append('1.3.6.1.4.1.2021.4.5.0')         # Total RAM
+        oids.append('1.3.6.1.4.1.2021.4.6.0')         # Used RAM
+    else:
+        # Generic/Unknown - just get uptime
+        pass
+
+    try:
+        auth_data = CommunityData(community) if version == 'v2c' else UsmUserData('snmpuser')
+        transport = UdpTransportTarget((ip, port), timeout=timeout, retries=0)
+
+        var_binds = [ObjectType(ObjectIdentity(oid)) for oid in oids]
+
+        errorIndication, errorStatus, errorIndex, resVarBinds = next(
+            getCmd(SnmpEngine(), auth_data, transport, ContextData(), *var_binds)
+        )
+
+        if errorIndication or errorStatus:
+            return {"ok": False, "error": str(errorIndication or errorStatus)}
+
+        data = {"ok": True, "raw": {}}
+        for vb in resVarBinds:
+            data["raw"][str(vb[0])] = str(vb[1])
+
+        # Process metrics
+        data["uptime_ticks"] = data["raw"].get(OID_UPTIME, "0")
+
+        if template == "cisco_ios":
+            data["cpu"] = int(data["raw"].get('1.3.6.1.4.1.9.9.109.1.1.1.1.7.1', 0))
+            free = int(data["raw"].get('1.3.6.1.4.1.9.9.48.1.1.1.5.1', 1))
+            used = int(data["raw"].get('1.3.6.1.4.1.9.9.48.1.1.1.6.1', 0))
+            data["ram"] = int((used / (used + free)) * 100) if (used+free) > 0 else 0
+        elif template == "fortigate":
+            data["cpu"] = int(data["raw"].get('1.3.6.1.4.1.12356.101.4.1.3.0', 0))
+            data["ram"] = int(data["raw"].get('1.3.6.1.4.1.12356.101.4.1.4.0', 0))
+            data["sessions"] = data["raw"].get('1.3.6.1.4.1.12356.101.4.1.8.0', "0")
+        elif template == "windows":
+            data["cpu"] = int(data["raw"].get('1.3.6.1.2.1.25.3.3.1.2.1', 0))
+            used = int(data["raw"].get('1.3.6.1.2.1.25.2.3.1.6.1', 0))
+            total = int(data["raw"].get('1.3.6.1.2.1.25.2.3.1.5.1', 1))
+            data["ram"] = int((used / total) * 100) if total > 0 else 0
+        elif template == "linux":
+            idle = int(data["raw"].get('1.3.6.1.4.1.2021.11.11.0', 100))
+            data["cpu"] = 100 - idle
+            total = int(data["raw"].get('1.3.6.1.4.1.2021.4.5.0', 1))
+            used = int(data["raw"].get('1.3.6.1.4.1.2021.4.6.0', 0))
+            data["ram"] = int((used / total) * 100) if total > 0 else 0
+        else:
+            data["cpu"] = 0
+            data["ram"] = 0
+
+        return data
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+def get_interface_stats(ip, settings):
+    """
+    Fetches interface list and status.
+    """
+    version = settings.get('snmp_version', 'v2c')
+    community = settings.get('community', 'public')
+    timeout = float(settings.get('timeout', 1500)) / 1000.0
+    port = int(settings.get('snmp_port', 161))
+
+    try:
+        auth_data = CommunityData(community) if version == 'v2c' else UsmUserData('snmpuser')
+        transport = UdpTransportTarget((ip, port), timeout=timeout, retries=0)
+
+        interfaces = []
+        # Walk ifTable
+        for (errorIndication, errorStatus, errorIndex, varBinds) in nextCmd(
+            SnmpEngine(), auth_data, transport, ContextData(),
+            ObjectType(ObjectIdentity('1.3.6.1.2.1.2.2.1.2')),  # ifDescr
+            ObjectType(ObjectIdentity('1.3.6.1.2.1.2.2.1.8')),  # ifOperStatus
+            ObjectType(ObjectIdentity('1.3.6.1.2.1.2.2.1.10')), # ifInOctets
+            ObjectType(ObjectIdentity('1.3.6.1.2.1.2.2.1.16')), # ifOutOctets
+            lexicographicMode=False
+        ):
+            if errorIndication or errorStatus: break
+            name = str(varBinds[0][1])
+            status = int(varBinds[1][1])
+            in_octets = int(varBinds[2][1])
+            out_octets = int(varBinds[3][1])
+            interfaces.append({
+                "name": name,
+                "status": status,
+                "in_octets": in_octets,
+                "out_octets": out_octets,
+                "ts": __import__('time').time()
+            })
+
+        return {"ok": True, "interfaces": interfaces}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 def bulk_discovery(ips, settings, callback):
     """
     Performs SNMP discovery on a list of IPs.
