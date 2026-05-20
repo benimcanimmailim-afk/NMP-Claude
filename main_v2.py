@@ -166,7 +166,9 @@ class Api:
         return {"ok": True}
 
     # ── device CRUD ───────────────────────────────────────────────────────────
-    def add_device(self, ip: str, label: str = "") -> dict:
+    def add_device(self, ip: str, label: str = "", mac: str = "N/A", vendor: str = "Unknown",
+                   alive: bool = None, latency: float = None, hostname: str = "",
+                   log: list = None, push: bool = True) -> dict:
         ip = ip.strip()
         if not ip:
             return {"ok": False, "error": "Boş IP"}
@@ -178,11 +180,13 @@ class Api:
             if ip not in self._devices:
                 self._devices[ip] = {
                     "ip": ip, "label": label or ip,
-                    "mac": "N/A", "vendor": "Unknown",
-                    "alive": None, "latency": None,
-                    "hostname": "", "log": []
+                    "mac": mac, "vendor": vendor,
+                    "alive": alive, "latency": latency,
+                    "hostname": hostname, "log": log or []
                 }
                 self._start_ping(ip)
+            if push:
+                self._push_json("_onDeviceAdded", self._devices[ip])
         return {"ok": True, "ip": ip}
 
     def add_devices_bulk(self, text: str) -> dict:
@@ -357,6 +361,9 @@ class Api:
                     if res["alive"]:
                         mac    = get_mac_for_ip(ip)
                         vendor = get_vendor(mac)
+                        # Register in backend and push to UI immediately
+                        self.add_device(ip, label=vendor or ip, mac=mac, vendor=vendor,
+                                        alive=True, latency=res["latency"], push=True)
                         found.append({"ip":ip,"mac":mac,"vendor":vendor,"latency":res["latency"]})
             self._push_json("_onScanComplete", found)
 
@@ -382,7 +389,17 @@ class Api:
         with self._lock:
             self._devices.clear()
         for d in data:
-            self.add_device(d.get("ip",""), d.get("label",""))
+            self.add_device(
+                ip=d.get("ip",""),
+                label=d.get("label",""),
+                mac=d.get("mac","N/A"),
+                vendor=d.get("vendor","Unknown"),
+                alive=d.get("alive"),
+                latency=d.get("latency"),
+                hostname=d.get("hostname",""),
+                log=d.get("log", []),
+                push=False
+            )
         return {"ok": True, "devices": data}
 
     def delete_profile(self, name: str) -> dict:
@@ -1177,9 +1194,15 @@ window._onScanComplete=json=>{
   const found=JSON.parse(json);
   document.getElementById('scanProgLbl').textContent=`Tamamlandı — ${found.length} cihaz`;
   document.getElementById('scanBtn').disabled=false;
-  found.forEach(d=>addDeviceToUI({ip:d.ip,label:d.vendor||d.ip,mac:d.mac,vendor:d.vendor,alive:true,latency:d.latency,hostname:'',log:[]},true));
+  // found.forEach(d=>addDeviceToUI(...)) removed as backend now calls _onDeviceAdded
   toast('✔ '+found.length+' cihaz bulundu','ok');
   setTimeout(()=>closeModal('scanModal'),1200);
+};
+
+// ─── DEVICE UPDATES ───────────────────────────────────────────────────────────
+window._onDeviceAdded=json=>{
+  const d=JSON.parse(json);
+  addDeviceToUI(d, true);
 };
 
 // ─── PING UPDATES ─────────────────────────────────────────────────────────────
