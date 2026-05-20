@@ -15,6 +15,7 @@ import re
 import sys
 import ipaddress
 import platform
+import snmp_manager
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -142,6 +143,7 @@ class Api:
         self._running   = True
         self._lock      = threading.Lock()
         self._settings  = load_settings()
+        self._current_profile = None
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _push(self, js: str):
@@ -182,7 +184,13 @@ class Api:
                     "ip": ip, "label": label or ip,
                     "mac": mac, "vendor": vendor,
                     "alive": alive, "latency": latency,
-                    "hostname": hostname, "log": log or []
+                    "hostname": hostname, "log": log or [],
+                    "snmp_active": None,
+                    "snmp_version": "v2c",
+                    "community": "public",
+                    "snmp_port": 161,
+                    "device_template": "unknown",
+                    "last_snmp_check": None
                 }
                 self._start_ping(ip)
             if push:
@@ -370,6 +378,66 @@ class Api:
         threading.Thread(target=_task, daemon=True).start()
         return {"ok": True}
 
+    # ── snmp discovery ────────────────────────────────────────────────────────
+    def start_snmp_scan(self, settings: dict) -> dict:
+        """
+        Starts SNMP scan for currently online devices.
+        """
+        with self._lock:
+            online_ips = [ip for ip, d in self._devices.items() if d.get("alive") is True]
+
+        if not online_ips:
+            return {"ok": False, "error": "Taranacak online cihaz bulunamadı."}
+
+        def _on_result(res):
+            ip = res["ip"]
+            with self._lock:
+                if ip in self._devices:
+                    dev = self._devices[ip]
+                    dev["snmp_active"]     = res["snmp_active"]
+                    if res["snmp_active"]:
+                        dev["snmp_version"]    = res["snmp_version"]
+                        dev["community"]       = res["community"]
+                        dev["snmp_port"]       = res["snmp_port"]
+                        dev["device_template"] = res["device_template"]
+                        dev["last_snmp_check"] = ts()
+
+                    # Push update to UI
+                    payload = {
+                        "ip": ip,
+                        "snmp_active": dev["snmp_active"],
+                        "snmp_version": dev["snmp_version"],
+                        "device_template": dev["device_template"],
+                        "alive": dev["alive"],
+                        "latency": dev["latency"]
+                    }
+                    self._push_json("_onSnmpUpdate", payload)
+
+        def _task():
+            snmp_manager.bulk_discovery(online_ips, settings, _on_result)
+            if settings.get("save") and self._current_profile:
+                self.save_profile(self._current_profile)
+            self._push("window._onSnmpComplete()")
+
+        threading.Thread(target=_task, daemon=True).start()
+        return {"ok": True, "count": len(online_ips)}
+
+    def test_single_snmp(self, ip: str, settings: dict) -> dict:
+        timeout = float(settings.get("timeout", 1500)) / 1000.0
+        r = snmp_manager.snmp_test(
+            ip,
+            version=settings.get("version", "v2c"),
+            community=settings.get("community", "public"),
+            timeout=timeout,
+            port=int(settings.get("port", 161))
+        )
+        return r
+
+    def _save_all_to_current_profile(self):
+        # Implementation of auto-save if needed, or we can just use save_profile logic
+        # For now, we don't have a "current" profile name easily available without tracking it.
+        pass
+
     # ── profile management ────────────────────────────────────────────────────
     def save_profile(self, name: str) -> dict:
         if not name.strip():
@@ -378,6 +446,7 @@ class Api:
         path = PROFILES_DIR / f"{safe}.json"
         with self._lock:
             data = list(self._devices.values())
+            self._current_profile = safe
         path.write_text(json.dumps(data, indent=2, ensure_ascii=False), "utf-8")
         return {"ok": True, "name": safe}
 
@@ -388,6 +457,7 @@ class Api:
         data = json.loads(path.read_text("utf-8"))
         with self._lock:
             self._devices.clear()
+            self._current_profile = name
         for d in data:
             self.add_device(
                 ip=d.get("ip",""),
@@ -400,6 +470,15 @@ class Api:
                 log=d.get("log", []),
                 push=False
             )
+            # Restore SNMP fields
+            with self._lock:
+                dev = self._devices[d.get("ip")]
+                dev["snmp_active"]     = d.get("snmp_active")
+                dev["snmp_version"]    = d.get("snmp_version", "v2c")
+                dev["community"]       = d.get("community", "public")
+                dev["snmp_port"]       = d.get("snmp_port", 161)
+                dev["device_template"] = d.get("device_template", "unknown")
+                dev["last_snmp_check"] = d.get("last_snmp_check")
         return {"ok": True, "devices": data}
 
     def delete_profile(self, name: str) -> dict:
@@ -477,6 +556,7 @@ HTML = r"""<!DOCTYPE html>
   --green:   #10b981;
   --red:     #ef4444;
   --yellow:  #f59e0b;
+  --blue:    #00d4ff;
   --text:    #e2e8f0;
   --muted:   #64748b;
   --mono:    'JetBrains Mono','Consolas',monospace;
@@ -615,6 +695,25 @@ header {
 .c-red    { color:var(--red); }
 .c-blue   { color:var(--accent); }
 .c-yellow { color:var(--yellow); }
+
+/* SNMP Icon */
+.snmp-icon {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 18px; height: 18px; border-radius: 4px;
+  font-size: 9px; font-weight: 800; border: 1px solid transparent;
+  transition: all .3s; cursor: help; margin-right: 6px; vertical-align: middle;
+}
+.snmp-active  {
+  color: var(--blue); border-color: color-mix(in srgb, var(--blue) 40%, transparent);
+  background: color-mix(in srgb, var(--blue) 10%, transparent);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--blue) 30%, transparent);
+}
+.snmp-fail    { color: var(--muted); border-color: var(--border); background: var(--hover); }
+.snmp-error   {
+  color: var(--yellow); border-color: color-mix(in srgb, var(--yellow) 40%, transparent);
+  background: color-mix(in srgb, var(--yellow) 10%, transparent);
+}
+.snmp-none    { display: none; }
 
 /* ── MAIN ── */
 main { position:fixed; top:104px; bottom:0; left:0; right:0;
@@ -811,6 +910,9 @@ main { position:fixed; top:104px; bottom:0; left:0; right:0;
   <button class="btn btn-ghost" onclick="openModal('scanModal')">
     <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>Ağ Keşfi
   </button>
+  <button class="btn btn-ghost" onclick="openSnmpModal()">
+    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12h14M12 5v14"/></svg>📡 SNMP Tara
+  </button>
 
   <div class="nav-right">
     <!-- Theme Switch -->
@@ -975,6 +1077,62 @@ main { position:fixed; top:104px; bottom:0; left:0; right:0;
   </div>
 </div>
 
+<!-- ═══ MODAL: SNMP Discovery ════════════════════════════════════════════════ -->
+<div class="overlay" id="snmpModal">
+  <div class="modal">
+    <div class="modal-title">📡 SNMP Keşfi</div>
+    <div class="modal-sub">Online cihazlarda SNMP servislerini tara ve cihaz tiplerini belirle.</div>
+
+    <div class="mrow">
+      <div class="field">
+        <label>SNMP Versiyon</label>
+        <select class="finput" id="snmpVer" style="padding:0 8px">
+          <option value="v2c">v2c</option>
+          <option value="v3">v3</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Community String</label>
+        <input type="text" class="finput" id="snmpComm" value="public">
+      </div>
+    </div>
+
+    <div class="mrow">
+      <div class="field">
+        <label>Timeout (ms)</label>
+        <input type="number" class="finput" id="snmpTimeout" value="1500">
+      </div>
+      <div class="field">
+        <label>Port</label>
+        <input type="number" class="finput" id="snmpPort" value="161">
+      </div>
+    </div>
+
+    <div class="mrow">
+      <div class="field">
+        <label>Thread Sayısı</label>
+        <input type="number" class="finput" id="snmpWorkers" value="50">
+      </div>
+      <div class="field" style="display:flex; flex-direction:column; gap:6px; padding-top:10px">
+        <div style="display:flex; align-items:center; gap:8px">
+          <input type="checkbox" id="snmpAutoDetect" checked>
+          <label style="margin-bottom:0; font-size:10px">Otomatik Cihaz Tanıma</label>
+        </div>
+        <div style="display:flex; align-items:center; gap:8px">
+          <input type="checkbox" id="snmpSave">
+          <label style="margin-bottom:0; font-size:10px">Çalışan Cihazları Kaydet</label>
+        </div>
+      </div>
+    </div>
+
+    <div class="mactions">
+      <button class="btn btn-ghost" onclick="closeModal('snmpModal')">İptal</button>
+      <button class="btn btn-ghost" id="snmpTestBtn" onclick="testSnmp()">Test</button>
+      <button class="btn btn-accent" id="snmpScanBtn" onclick="startSnmpScan()">Taramayı Başlat</button>
+    </div>
+  </div>
+</div>
+
 <!-- ═══ MODAL: Kesinti Geçmişi ════════════════════════════════════════════════ -->
 <div class="overlay" id="logModal">
   <div class="modal">
@@ -1059,12 +1217,23 @@ function buildStatus(dev){
   return `<span style="color:var(--muted);font-size:11px">⋯ Bekleniyor</span>`;
 }
 
+function snmpIconId(ip){ return 'snmp-'+ip.replace(/\./g,'-'); }
+
+function buildSnmpIcon(dev){
+  if(dev.snmp_active === true) return `<span class="snmp-icon snmp-active" id="${snmpIconId(dev.ip)}" title="SNMP Aktif\nVersiyon: ${dev.snmp_version}\nŞablon: ${dev.device_template}">S</span>`;
+  if(dev.snmp_active === false) return `<span class="snmp-icon snmp-fail" id="${snmpIconId(dev.ip)}" title="SNMP Erişilemez">S</span>`;
+  return `<span class="snmp-icon snmp-none" id="${snmpIconId(dev.ip)}">S</span>`;
+}
+
 function buildCardHTML(dev){
   return `
     <div style="display:flex;align-items:center;justify-content:center">
       <div class="led ${ledCls(dev.alive)}" id="${ledId(dev.ip)}"></div>
     </div>
-    <div class="cell c-ip">${esc(dev.ip)}</div>
+    <div class="cell c-ip">
+      ${buildSnmpIcon(dev)}
+      ${esc(dev.ip)}
+    </div>
     <div class="cell c-lbl">
       <span class="lbl-main">${esc(dev.label||dev.ip)}</span>
       <span class="lbl-hn" id="${hnId(dev.ip)}">${esc(dev.hostname||'')}</span>
@@ -1101,10 +1270,25 @@ function updateCardDOM(dev){
   const led  = document.getElementById(ledId(dev.ip));
   const latEl= document.getElementById(latId(dev.ip));
   const stEl = document.getElementById(stId(dev.ip));
+  const snmpEl = document.getElementById(snmpIconId(dev.ip));
+
   if(led)  led.className = 'led '+ledCls(dev.alive);
   if(latEl){ latEl.className='cell c-lat '+latClass(dev.latency); latEl.textContent=latText(dev.latency); }
   if(dev.alive===false){ card.classList.add('offline'); if(!timers[dev.ip]){ if(stEl) stEl.innerHTML=`<span class="c-timer" id="${timId(dev.ip)}">⏱ 00:00:00</span>`; startTimer(dev.ip); } }
   else { card.classList.remove('offline'); stopTimer(dev.ip); if(stEl) stEl.innerHTML=buildStatus(dev); }
+
+  if(snmpEl && dev.snmp_active !== undefined){
+    if(dev.snmp_active === true){
+      snmpEl.className = 'snmp-icon snmp-active';
+      snmpEl.title = `SNMP Aktif\nVersiyon: ${dev.snmp_version}\nŞablon: ${dev.device_template}`;
+    } else if(dev.snmp_active === false){
+      snmpEl.className = 'snmp-icon snmp-fail';
+      snmpEl.title = `SNMP Erişilemez`;
+    } else {
+      snmpEl.className = 'snmp-icon snmp-none';
+    }
+  }
+
   updateStats();
 }
 
@@ -1186,6 +1370,78 @@ async function startScan(){
   const r = await window.pywebview.api.scan_network(s,e);
   if(!r.ok){ toast('✘ '+r.error,'err'); document.getElementById('scanBtn').disabled=false; }
 }
+
+// ─── SNMP ─────────────────────────────────────────────────────────────────────
+function openSnmpModal(){ openModal('snmpModal'); }
+
+async function startSnmpScan(){
+  const settings = {
+    version: document.getElementById('snmpVer').value,
+    community: document.getElementById('snmpComm').value.trim(),
+    timeout: parseInt(document.getElementById('snmpTimeout').value),
+    port: parseInt(document.getElementById('snmpPort').value),
+    workers: parseInt(document.getElementById('snmpWorkers').value),
+    auto_detect: document.getElementById('snmpAutoDetect').checked,
+    save: document.getElementById('snmpSave').checked
+  };
+
+  document.getElementById('snmpScanBtn').disabled = true;
+  document.getElementById('snmpScanBtn').textContent = 'Taranıyor...';
+
+  const r = await window.pywebview.api.start_snmp_scan(settings);
+  if(!r.ok){
+    toast('✘ ' + r.error, 'err');
+    document.getElementById('snmpScanBtn').disabled = false;
+    document.getElementById('snmpScanBtn').textContent = 'Taramayı Başlat';
+  } else {
+    toast('📡 ' + r.count + ' cihaz için SNMP taraması başlatıldı', 'inf');
+  }
+}
+
+async function testSnmp(){
+  const settings = {
+    version: document.getElementById('snmpVer').value,
+    community: document.getElementById('snmpComm').value.trim(),
+    timeout: parseInt(document.getElementById('snmpTimeout').value),
+    port: parseInt(document.getElementById('snmpPort').value),
+  };
+
+  // Test current selected device or first online
+  let targetIp = ctxIp;
+  if(!targetIp){
+    const online = Object.values(devices).find(d => d.alive);
+    if(online) targetIp = online.ip;
+  }
+
+  if(!targetIp){
+    toast('Test için online cihaz bulunamadı','err');
+    return;
+  }
+
+  toast('SNMP Test ediliyor: ' + targetIp, 'inf');
+  document.getElementById('snmpTestBtn').disabled = true;
+
+  const r = await window.pywebview.api.test_single_snmp(targetIp, settings);
+  document.getElementById('snmpTestBtn').disabled = false;
+
+  if(r.ok){
+    toast('✔ SNMP Başarılı: ' + r.sysName, 'ok');
+  } else {
+    toast('✘ SNMP Hatası: ' + r.error, 'err');
+  }
+}
+
+window._onSnmpUpdate = json => {
+  const d = JSON.parse(json);
+  updateCardDOM(d);
+};
+
+window._onSnmpComplete = () => {
+  toast('✔ SNMP taraması tamamlandı', 'ok');
+  document.getElementById('snmpScanBtn').disabled = false;
+  document.getElementById('snmpScanBtn').textContent = 'Taramayı Başlat';
+  setTimeout(() => closeModal('snmpModal'), 1500);
+};
 window._onScanProgress=pct=>{
   document.getElementById('scanProgBar').style.width=pct+'%';
   document.getElementById('scanProgLbl').textContent=`Taranıyor... %${pct}`;
