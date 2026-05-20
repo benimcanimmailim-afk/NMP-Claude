@@ -506,7 +506,9 @@ class Api:
             )
             # Restore SNMP fields
             with self._lock:
-                dev = self._devices[d.get("ip")]
+                ip = d.get("ip")
+                if ip not in self._devices: continue
+                dev = self._devices[ip]
                 dev["snmp_active"]     = d.get("snmp_active")
                 dev["snmp_version"]    = d.get("snmp_version", "v2c")
                 dev["community"]       = d.get("community", "public")
